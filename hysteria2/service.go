@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/quic-go"
@@ -68,7 +69,7 @@ type Service[U comparable] struct {
 	geckoMaxPacketSize    int
 	tlsConfig             aTLS.ServerConfig
 	quicConfig            *quic.Config
-	userMap               map[string]U
+	userMap               atomic.Pointer[map[string]U] // swapped atomically by UpdateUsers
 	udpDisabled           bool
 	udpTimeout            time.Duration
 	handler               ServerHandler
@@ -138,7 +139,6 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		geckoMaxPacketSize:    options.GeckoMaxPacketSize,
 		tlsConfig:             options.TLSConfig,
 		quicConfig:            quicConfig,
-		userMap:               make(map[string]U),
 		udpDisabled:           options.UDPDisabled,
 		udpTimeout:            options.UDPTimeout,
 		handler:               options.Handler,
@@ -148,12 +148,20 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 	}, nil
 }
 
+// loadUsers returns the current user table (nil before the first UpdateUsers).
+func (s *Service[U]) loadUsers() map[string]U {
+	if userMap := s.userMap.Load(); userMap != nil {
+		return *userMap
+	}
+	return nil
+}
+
 func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
 	userMap := make(map[string]U)
 	for i, user := range userList {
 		userMap[passwordList[i]] = user
 	}
-	s.userMap = userMap
+	s.userMap.Store(&userMap)
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
@@ -280,7 +288,7 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		request := protocol.AuthRequestFromHeader(r.Header)
-		user, loaded := s.userMap[request.Auth]
+		user, loaded := s.loadUsers()[request.Auth]
 		if !loaded {
 			s.masqueradeHandler.ServeHTTP(w, r)
 			return

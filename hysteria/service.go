@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/quic-go"
@@ -51,7 +52,7 @@ type Service[U comparable] struct {
 	xplusPassword string
 	tlsConfig     aTLS.ServerConfig
 	quicConfig    *quic.Config
-	userMap       map[string]U
+	userMap       atomic.Pointer[map[string]U] // swapped atomically by UpdateUsers
 	udpDisabled   bool
 	udpTimeout    time.Duration
 	handler       ServerHandler
@@ -90,11 +91,18 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		xplusPassword: options.XPlusPassword,
 		tlsConfig:     options.TLSConfig,
 		quicConfig:    quicConfig,
-		userMap:       make(map[string]U),
 		handler:       options.Handler,
 		udpDisabled:   options.UDPDisabled,
 		udpTimeout:    options.UDPTimeout,
 	}, nil
+}
+
+// loadUsers returns the current user table (nil before the first UpdateUsers).
+func (s *Service[U]) loadUsers() map[string]U {
+	if userMap := s.userMap.Load(); userMap != nil {
+		return *userMap
+	}
+	return nil
 }
 
 func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
@@ -102,7 +110,7 @@ func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
 	for i, user := range userList {
 		userMap[passwordList[i]] = user
 	}
-	s.userMap = userMap
+	s.userMap.Store(&userMap)
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
@@ -173,7 +181,7 @@ func (s *serverSession[U]) handleConnection() {
 		s.closeWithError0(ErrorCodeProtocolError, E.Cause(err, "read client hello"))
 		return
 	}
-	user, loaded := s.userMap[clientHello.Auth]
+	user, loaded := s.loadUsers()[clientHello.Auth]
 	if !loaded {
 		WriteServerHello(controlStream, ServerHello{
 			OK:      false,
